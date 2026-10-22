@@ -1,0 +1,115 @@
+name: Branch Policy
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  # Repos using a merge queue need the required check to report on queued merges too.
+  merge_group:
+
+env:
+  # Edit these lines to change the model for this repo.
+  STAGING_BRANCH: dev
+  ALLOWED_PREFIXES: feat|fix|chore|hotfix|refactor|test|docs|perf|ci|build|revert|dependabot|renovate
+  CONVENTIONAL_TYPES: feat|fix|perf|refactor|chore|docs|test|build|ci|revert
+  REQUIRE_CONVENTIONAL_TITLE: true
+
+permissions: {}
+
+jobs:
+  branch-policy:
+    # The ruleset's required status check matches this name exactly — don't rename it.
+    name: branch-policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check PR source branch
+        # Already checked when the PR was opened; merge-queue runs have no head_ref to check.
+        if: github.event_name == 'pull_request'
+        # Branch names arrive via env, never ${{ }} in the script, so a crafted name can't inject shell.
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_BRANCH" = "$STAGING_BRANCH" ]; then
+            echo "::error::'$STAGING_BRANCH' is a throwaway staging branch, reset weekly from the default branch. Open the PR from your topic branch instead."
+            exit 1
+          fi
+          # Bot and GitHub-generated names: release-please's Release PR branch and the Revert button's branch.
+          if ! printf '%s' "$HEAD_BRANCH" | grep -Eq "^(($ALLOWED_PREFIXES)/|release-please--branches--|revert-[0-9]+-)[A-Za-z0-9._/-]+\$"; then
+            echo "::error::Branch '$HEAD_BRANCH' must be named <prefix>/<description>, e.g. feat/TICKET-123/short-description. Allowed prefixes: $ALLOWED_PREFIXES (lowercase). Rename with: git branch -m <new-name> && git push -u origin <new-name>"
+            exit 1
+          fi
+          echo "Branch '$HEAD_BRANCH' follows the branching model."
+
+      # A PR into another branch (e.g. a release branch) can legitimately carry trunk merges this check would flag.
+      - name: Fetch history
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == github.event.repository.default_branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Check the branch doesn't carry staging merges
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == github.event.repository.default_branch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # Merge commits made on the staging branch (topic → dev, merged with --no-ff) sit on its first-parent chain
+          # and nowhere else, so a PR containing one was branched from, or merged in, the staging branch.
+          # Archive tags catch branches cut from dev before a reset; only names the reset workflow produces count.
+          git fetch --quiet --no-tags origin "+refs/tags/$STAGING_BRANCH-archive/*:refs/tags/$STAGING_BRANCH-archive/*"
+          sources=()
+          # Future-dated names are ignored, as in the reset's cleanup, so a planted tag can't block PRs forever.
+          now=$(date -u +%Y-%m-%d-%H%M%S)
+          while IFS= read -r tag; do
+            [[ ${tag#"$STAGING_BRANCH-archive/"} < "$now" ]] && sources+=("refs/tags/$tag")
+          done < <(git tag -l "$STAGING_BRANCH-archive/*" \
+            | { grep -E "^$STAGING_BRANCH-archive/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-[0-9]+\$" || true; })
+          if git ls-remote --exit-code origin "refs/heads/$STAGING_BRANCH" >/dev/null; then
+            git fetch --quiet --no-tags origin "+refs/heads/$STAGING_BRANCH:refs/remotes/origin/$STAGING_BRANCH"
+            sources+=("refs/remotes/origin/$STAGING_BRANCH")
+          else
+            # 2 means the branch doesn't exist; anything else is a real error and must not skip the check.
+            rc=$?
+            [ "$rc" -eq 2 ] || exit "$rc"
+          fi
+          if [ ${#sources[@]} -eq 0 ]; then
+            echo "No '$STAGING_BRANCH' history to check against."
+            exit 0
+          fi
+          offending=$(comm -12 \
+            <(git rev-list "$BASE_SHA..$HEAD_SHA" | sort) \
+            <(git rev-list --first-parent --merges "${sources[@]}" "^$BASE_SHA" | sort -u))
+          if [ -z "$offending" ]; then
+            echo "No '$STAGING_BRANCH' merges in this branch."
+            exit 0
+          fi
+          echo "::error::This branch contains merge commits made on '$STAGING_BRANCH', so it would bring other people's unreviewed staging work into the trunk. Recreate it from the default branch and cherry-pick only your own commits: git checkout -b <new-name> origin/$DEFAULT_BRANCH && git cherry-pick <your commits>"
+          # Commit subjects are author-controlled; stop-commands keeps them from being read as workflow commands.
+          stop=$(openssl rand -hex 16)
+          echo "::stop-commands::$stop"
+          echo "Staging merge commits found in this branch:"
+          # shellcheck disable=SC2086
+          git log --no-walk --format='  %h %s' $offending
+          echo "::$stop::"
+          exit 1
+
+      - name: Check PR title
+        # Last, and runs even when an earlier step failed, so the author sees every error at once.
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [ "$REQUIRE_CONVENTIONAL_TITLE" != true ]; then
+            echo "PR title check is switched off (REQUIRE_CONVENTIONAL_TITLE is not 'true')."
+            exit 0
+          fi
+          pattern="^($CONVENTIONAL_TYPES)(\\([A-Za-z0-9._/-]+\\))?!?: [^ ].*\$"
+          if [[ ! $PR_TITLE =~ $pattern ]]; then
+            echo "::error::The PR title must be <type>(<optional scope>)!: <description>. Allowed types: $CONVENTIONAL_TYPES. Examples: 'feat(checkout): add Apple Pay', 'fix!: drop the v1 webhook payload'. A '!' marks a breaking change and triggers a major release. A PR made with the Revert button should be retitled 'revert: <original title>'."
+            exit 1
+          fi
+          echo "PR title follows Conventional Commits."

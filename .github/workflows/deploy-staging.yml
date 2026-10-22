@@ -1,0 +1,24 @@
+name: Deploy Staging
+on:
+  push:
+    branches: [dev]
+  workflow_run:
+    workflows: [Reset Dev Branch]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.path == '.github/workflows/reset-dev-branch.yml')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+      - run: echo "Would deploy dev @ $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"

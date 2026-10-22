@@ -1,0 +1,126 @@
+name: Reset Dev Branch
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0' # Sundays 00:00 UTC
+
+env:
+  # Must match STAGING_BRANCH in branch-policy.yml.
+  STAGING_BRANCH: dev
+  # How many <staging>-archive/* tags to keep; older ones are deleted after each reset.
+  KEEP_ARCHIVES: 8
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: reset-dev-branch
+  cancel-in-progress: false
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          filter: tree:0
+          persist-credentials: false
+
+      - name: Archive the staging branch and point it at the default branch
+        env:
+          # Everything except moving the branch uses the built-in token: a tag pushed with the PAT would run
+          # the old staging tree's tag-triggered workflows with repo secrets, and the built-in token's refs trigger nothing.
+          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN can't move a branch across commits that change .github/workflows/; RESET_TOKEN (a PAT or app token with workflow rights) can.
+          RESET_TOKEN: ${{ secrets.RESET_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq .default_branch)
+          sha=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+          if old=$(gh api "repos/$REPO/git/ref/heads/$STAGING_BRANCH" --jq .object.sha 2>&1); then
+            if [ "$old" = "$sha" ]; then
+              echo "$STAGING_BRANCH already matches $DEFAULT_BRANCH @ $sha"
+              exit 0
+            fi
+            tag="$STAGING_BRANCH-archive/$(date -u +%Y-%m-%d-%H%M%S)-$GITHUB_RUN_ID"
+            if ! gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$old" --silent; then
+              echo "::warning::Could not save $STAGING_BRANCH as tag $tag; resetting without an archive."
+              tag=""
+            fi
+
+            GH_TOKEN=$RESET_TOKEN gh api -X PATCH "repos/$REPO/git/refs/heads/$STAGING_BRANCH" -f sha="$sha" -F force=true --silent
+            echo "Reset $STAGING_BRANCH to $DEFAULT_BRANCH @ $sha (previous tip $old)"
+
+            # Branches whose tip was on the staging branch but not in the trunk drop off staging now.
+            # Squash and rebase merges leave the tip outside the trunk, so a merged PR also counts as landed.
+            list_dropped() {
+              git cat-file -e "$old^{commit}" && git cat-file -e "$sha^{commit}" || return 1
+              local ref branch merged
+              while IFS= read -r ref; do
+                branch=${ref#refs/remotes/origin/}
+                case "$branch" in HEAD|"$STAGING_BRANCH"|"$DEFAULT_BRANCH") continue ;; esac
+                git merge-base --is-ancestor "$ref" "$old" || continue
+                ! git merge-base --is-ancestor "$ref" "$sha" || continue
+                merged=$(gh pr list --repo "$REPO" --head "$branch" --base "$DEFAULT_BRANCH" --state merged --limit 1 --json number --jq length) || return 1
+                [ "$merged" = 0 ] || continue
+                printf '%s\n' "$branch"
+              done < <(git for-each-ref --format='%(refname)' refs/remotes/origin)
+            }
+
+            {
+              echo "## Reset \`$STAGING_BRANCH\` to \`$DEFAULT_BRANCH\`"
+              echo
+              if [ -n "$tag" ]; then
+                echo "The previous \`$STAGING_BRANCH\` is saved as tag \`$tag\`."
+              else
+                echo "The previous \`$STAGING_BRANCH\` (\`$old\`) could not be saved as a tag."
+              fi
+              echo
+              if ! dropped=$(list_dropped); then
+                echo "Could not work out which branches dropped off staging."
+              elif [ -z "$dropped" ]; then
+                echo "No unmerged branches dropped off staging."
+              else
+                echo "These branches were on \`$STAGING_BRANCH\` but aren't merged to \`$DEFAULT_BRANCH\`. Merge them into \`$STAGING_BRANCH\` again if you still need them on staging:"
+                echo
+                # Branch names may contain Markdown/HTML; list only plain ones.
+                # shellcheck disable=SC2016
+                printf '%s\n' "$dropped" | { grep -E '^[A-Za-z0-9._/-]+$' || true; } | sed 's/.*/- `&`/'
+                others=$(printf '%s\n' "$dropped" | { grep -cvE '^[A-Za-z0-9._/-]+$' || true; })
+                if [ "$others" -gt 0 ]; then echo "- and $others branch(es) with unusual names"; fi
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif printf '%s' "$old" | grep -q 'HTTP 404'; then
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$STAGING_BRANCH" -f sha="$sha" --silent
+            echo "Created $STAGING_BRANCH at $DEFAULT_BRANCH @ $sha"
+          else
+            echo "::error::Could not look up $STAGING_BRANCH: $old"
+            exit 1
+          fi
+
+      - name: Delete old archive tags
+        # A failed cleanup mustn't mark the reset failed: staging deploys only follow successful runs.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! [[ $KEEP_ARCHIVES =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::KEEP_ARCHIVES must be a positive number, got '$KEEP_ARCHIVES'."
+            exit 1
+          fi
+          # Only names this workflow creates, and none dated in the future, so planted tags can't push real archives out.
+          prefix="refs/tags/$STAGING_BRANCH-archive/"
+          gh api --paginate "repos/$REPO/git/matching-refs/tags/$STAGING_BRANCH-archive/" --jq '.[].ref' \
+            | { grep -E "^${prefix}[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-[0-9]+\$" || true; } \
+            | LC_ALL=C sort \
+            | awk -v keep="$KEEP_ARCHIVES" -v start=$((${#prefix} + 1)) -v now="$(date -u +%Y-%m-%d-%H%M%S)" \
+                'substr($0, start, 17) <= now { refs[++n] = $0 } END { for (i = 1; i <= n - keep; i++) print refs[i] }' \
+            | while IFS= read -r ref; do
+                gh api -X DELETE "repos/$REPO/git/$ref" --silent
+                echo "Deleted ${ref#refs/tags/}"
+              done
